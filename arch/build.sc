@@ -61,7 +61,8 @@ object buckyball extends SbtModule { m =>
     override def moduleDeps   = Seq(m)
 
     override def ivyDeps = Agg(
-      ivy"org.scalatest::scalatest::3.2.19"
+      ivy"org.scalatest::scalatest::3.2.19",
+      ivy"edu.berkeley.cs::chiseltest:6.0.0"
       // ivy"org.scalatest::scalatest:3.2.16"
     )
 

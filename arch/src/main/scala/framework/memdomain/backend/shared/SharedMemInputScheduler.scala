@@ -13,6 +13,7 @@ class SharedMemInputScheduler(val b: GlobalConfig, val issuePortsK: Int) extends
   private val pbankWidth   = math.max(1, log2Ceil(totalBanks))
   private val srcWidth     = math.max(1, log2Ceil(totalChannel))
   private val chanCountW   = math.max(1, log2Ceil(totalChannel + 1))
+  private val scanWidth    = math.max(srcWidth + 1, log2Ceil(totalChannel * 2))
   private val issueCountW  = math.max(1, log2Ceil(issuePortsK + 1))
 
   require(totalChannel > 0, "SharedMemInputScheduler requires at least one input channel")
@@ -43,8 +44,18 @@ class SharedMemInputScheduler(val b: GlobalConfig, val issuePortsK: Int) extends
   private def orReduce(xs: Seq[Bool]): Bool =
     xs.reduceOption(_ || _).getOrElse(false.B)
 
+  private def widenForScan(idx: UInt): UInt = {
+    val width = idx.getWidth
+    if (width >= scanWidth) {
+      idx(scanWidth - 1, 0)
+    } else {
+      Cat(0.U((scanWidth - width).W), idx)
+    }
+  }
+
   private def wrapChannel(idx: UInt): UInt = {
-    val wrapped = Mux(idx >= totalChannel.U, idx - totalChannel.U, idx)
+    val wideIdx = widenForScan(idx)
+    val wrapped = Mux(wideIdx >= totalChannel.U(scanWidth.W), wideIdx - totalChannel.U(scanWidth.W), wideIdx)
     wrapped(srcWidth - 1, 0)
   }
 
@@ -70,6 +81,8 @@ class SharedMemInputScheduler(val b: GlobalConfig, val issuePortsK: Int) extends
   val issueIsWrite   = Wire(Vec(issuePortsK, Bool()))
   val issueReadBits  = Wire(Vec(issuePortsK, chiselTypeOf(io.inRead(0).req.bits)))
   val issueWriteBits = Wire(Vec(issuePortsK, chiselTypeOf(io.inWrite(0).req.bits)))
+  val issueBankReady = Wire(Vec(issuePortsK, Bool()))
+  val issueFired     = Wire(Vec(issuePortsK, Bool()))
 
   val rrPtr = RegInit(0.U(srcWidth.W))
 
@@ -77,7 +90,7 @@ class SharedMemInputScheduler(val b: GlobalConfig, val issuePortsK: Int) extends
     val eligibleByOrder = Wire(Vec(totalChannel, Bool()))
 
     for (pos <- 0 until totalChannel) {
-      val idx = wrapChannel(rrPtr + pos.U)
+      val idx = wrapChannel(widenForScan(rrPtr) + pos.U(scanWidth.W))
       val channelAlreadyIssued = orReduce((0 until slot).map(prev => issueValid(prev) && issueSrc(prev) === idx))
       val bankAlreadyIssued = orReduce(
         (0 until slot).map(prev => issueValid(prev) && issuePbank(prev) === io.targetPbank(idx))
@@ -91,7 +104,7 @@ class SharedMemInputScheduler(val b: GlobalConfig, val issuePortsK: Int) extends
     }
 
     val selectedPos = PriorityEncoder(eligibleByOrder)
-    val selectedSrc = wrapChannel(rrPtr + selectedPos)
+    val selectedSrc = wrapChannel(widenForScan(rrPtr) + widenForScan(selectedPos))
 
     issueValid(slot)     := eligibleByOrder.asUInt.orR
     issueSrc(slot)       := selectedSrc
@@ -99,19 +112,26 @@ class SharedMemInputScheduler(val b: GlobalConfig, val issuePortsK: Int) extends
     issueIsWrite(slot)   := candidateIsWrite(selectedSrc)
     issueReadBits(slot)  := readReqBits(selectedSrc)
     issueWriteBits(slot) := writeReqBits(selectedSrc)
+
+    issueBankReady(slot) := Mux(
+      issueIsWrite(slot),
+      io.bankWrite(issuePbank(slot)).req.ready,
+      io.bankRead(issuePbank(slot)).req.ready
+    )
+    issueFired(slot) := issueValid(slot) && issueBankReady(slot)
   }
 
-  val anyIssue  = issueValid.asUInt.orR
+  val anyIssue  = issueFired.asUInt.orR
   val lastGrant = Wire(UInt(srcWidth.W))
   lastGrant := issueSrc(0)
   for (slot <- 0 until issuePortsK) {
-    when(issueValid(slot)) {
+    when(issueFired(slot)) {
       lastGrant := issueSrc(slot)
     }
   }
 
   when(anyIssue) {
-    rrPtr := wrapChannel(lastGrant + 1.U)
+    rrPtr := wrapChannel(widenForScan(lastGrant) + 1.U(scanWidth.W))
   }
 
   val grantVec          = Wire(Vec(totalChannel, Bool()))
@@ -119,10 +139,10 @@ class SharedMemInputScheduler(val b: GlobalConfig, val issuePortsK: Int) extends
   val noIssuePortStall  = Wire(Vec(totalChannel, Bool()))
 
   for (ch <- 0 until totalChannel) {
-    grantVec(ch) := orReduce((0 until issuePortsK).map(slot => issueValid(slot) && issueSrc(slot) === ch.U))
+    grantVec(ch) := orReduce((0 until issuePortsK).map(slot => issueFired(slot) && issueSrc(slot) === ch.U))
 
     val conflictsWithGrantedBank =
-      orReduce((0 until issuePortsK).map(slot => issueValid(slot) && issuePbank(slot) === io.targetPbank(ch)))
+      orReduce((0 until issuePortsK).map(slot => issueFired(slot) && issuePbank(slot) === io.targetPbank(ch)))
 
     bankConflictStall(ch) :=
       candidateValid(ch) &&
@@ -135,11 +155,11 @@ class SharedMemInputScheduler(val b: GlobalConfig, val issuePortsK: Int) extends
         io.targetValid(ch) &&
         !grantVec(ch) &&
         !bankConflictStall(ch) &&
-        PopCount(issueValid) === issuePortsK.U
+        PopCount(issueFired) === issuePortsK.U
   }
 
   io.activeInputCount       := PopCount(candidateValid)
-  io.issuedCount            := PopCount(issueValid)
+  io.issuedCount            := PopCount(issueFired)
   io.bankConflictStallCount := PopCount(bankConflictStall)
   io.noIssuePortStallCount  := PopCount(noIssuePortStall)
 
@@ -170,6 +190,11 @@ class SharedMemInputScheduler(val b: GlobalConfig, val issuePortsK: Int) extends
 
   val readRespSrc  = RegInit(VecInit(Seq.fill(totalBanks)(0.U(srcWidth.W))))
   val writeRespSrc = RegInit(VecInit(Seq.fill(totalBanks)(0.U(srcWidth.W))))
+  val readRespValid = RegInit(VecInit(Seq.fill(totalBanks)(false.B)))
+  val readRespHoldSrc = RegInit(VecInit(Seq.fill(totalBanks)(0.U(srcWidth.W))))
+  val readRespData = RegInit(VecInit(Seq.fill(totalBanks)(0.U(b.memDomain.bankWidth.W))))
+  val writeRespValid = RegInit(VecInit(Seq.fill(totalBanks)(false.B)))
+  val writeRespHoldSrc = RegInit(VecInit(Seq.fill(totalBanks)(0.U(srcWidth.W))))
 
   for (bank <- 0 until totalBanks) {
     val readHits = Wire(Vec(issuePortsK, Bool()))
@@ -200,6 +225,25 @@ class SharedMemInputScheduler(val b: GlobalConfig, val issuePortsK: Int) extends
     when(io.bankWrite(bank).req.fire) {
       writeRespSrc(bank) := Mux1H((0 until issuePortsK).map(slot => writeHits(slot) -> issueSrc(slot)))
     }
+
+    val readRespOutReady = io.inRead(readRespHoldSrc(bank)).resp.ready
+    io.bankRead(bank).resp.ready := !readRespValid(bank) || readRespOutReady
+    when(io.bankRead(bank).resp.fire) {
+      readRespValid(bank) := true.B
+      readRespHoldSrc(bank) := readRespSrc(bank)
+      readRespData(bank) := io.bankRead(bank).resp.bits.data
+    }.elsewhen(readRespValid(bank) && readRespOutReady) {
+      readRespValid(bank) := false.B
+    }
+
+    val writeRespOutReady = io.inWrite(writeRespHoldSrc(bank)).resp.ready
+    io.bankWrite(bank).resp.ready := !writeRespValid(bank) || writeRespOutReady
+    when(io.bankWrite(bank).resp.fire) {
+      writeRespValid(bank) := true.B
+      writeRespHoldSrc(bank) := writeRespSrc(bank)
+    }.elsewhen(writeRespValid(bank) && writeRespOutReady) {
+      writeRespValid(bank) := false.B
+    }
   }
 
   for (ch <- 0 until totalChannel) {
@@ -207,18 +251,18 @@ class SharedMemInputScheduler(val b: GlobalConfig, val issuePortsK: Int) extends
     val writeRespHits = Wire(Vec(totalBanks, Bool()))
 
     for (bank <- 0 until totalBanks) {
-      readRespHits(bank)  := io.bankRead(bank).resp.valid && readRespSrc(bank) === ch.U
-      writeRespHits(bank) := io.bankWrite(bank).resp.valid && writeRespSrc(bank) === ch.U
+      readRespHits(bank)  := readRespValid(bank) && readRespHoldSrc(bank) === ch.U
+      writeRespHits(bank) := writeRespValid(bank) && writeRespHoldSrc(bank) === ch.U
     }
 
     io.inRead(ch).resp.valid     := readRespHits.asUInt.orR
     io.inRead(ch).resp.bits.data := Mux1H(
-      (0 until totalBanks).map(bank => readRespHits(bank) -> io.bankRead(bank).resp.bits.data)
+      (0 until totalBanks).map(bank => readRespHits(bank) -> readRespData(bank))
     )
 
     io.inWrite(ch).resp.valid   := writeRespHits.asUInt.orR
     io.inWrite(ch).resp.bits.ok := Mux1H(
-      (0 until totalBanks).map(bank => writeRespHits(bank) -> io.bankWrite(bank).resp.bits.ok)
+      (0 until totalBanks).map(bank => writeRespHits(bank) -> true.B)
     )
   }
 

@@ -110,7 +110,7 @@ class SharedMemBackend(val b: GlobalConfig) extends Module {
       assert(false.B, "SharedMemBackend allocation failed: no free physical shared bank\n")
     }
 
-    val freePbankId = mappingTable.indexWhere(_.valid === false.B)
+    val freePbankId = PriorityEncoder(VecInit(mappingTable.map(entry => !entry.valid)))
     freePbankId
   }
 
