@@ -126,27 +126,45 @@ class SharedMemBackend(val b: GlobalConfig) extends Module {
     accPipes(i).io.mem_req.is_shared := io.mem_req(i).is_shared
     accPipes(i).io.mem_req.hart_id   := io.mem_req(i).hart_id
 
-    // Bank-side defaults (only driven when a bank is actually connected)
-    accPipes(i).io.sramRead.req.ready  := false.B
-    accPipes(i).io.sramRead.resp.valid := false.B
-    accPipes(i).io.sramRead.resp.bits  := DontCare
-
-    accPipes(i).io.sramWrite.req.ready  := false.B
-    accPipes(i).io.sramWrite.resp.valid := false.B
-    accPipes(i).io.sramWrite.resp.bits  := DontCare
-
     accPipes(i).io.is_multi := isAcc(io.mem_req(i).hart_id, io.mem_req(i).bank_id)
   }
 
-  banks.zipWithIndex.foreach {
-    case (bank, _) =>
-      bank.io.sramRead.req.valid  := false.B
-      bank.io.sramRead.req.bits   := DontCare
-      bank.io.sramRead.resp.ready := true.B
+  private val issuePortsK = math.min(4, totalChannel)
+  val inputScheduler = Module(new SharedMemInputScheduler(b, issuePortsK))
 
-      bank.io.sramWrite.req.valid  := false.B
-      bank.io.sramWrite.req.bits   := DontCare
-      bank.io.sramWrite.resp.ready := true.B
+  for (i <- 0 until totalChannel) {
+    inputScheduler.io.inRead(i) <> accPipes(i).io.sramRead
+    inputScheduler.io.inWrite(i) <> accPipes(i).io.sramWrite
+
+    val reqValid = accPipes(i).io.sramRead.req.valid || accPipes(i).io.sramWrite.req.valid
+    val matchVec = VecInit(mappingTable.map(entry =>
+      entry.valid &&
+        (entry.hart_id === io.mem_req(i).hart_id) &&
+        (entry.vbank_id === io.mem_req(i).bank_id) &&
+        (!entry.is_multi ||
+          (entry.is_multi && (entry.group_id === io.mem_req(i).group_id)))
+    ))
+    val matchCount = PopCount(matchVec)
+
+    inputScheduler.io.targetValid(i) := matchCount === 1.U
+    inputScheduler.io.targetPbank(i) := PriorityEncoder(matchVec)
+
+    when(reqValid) {
+      assert(
+        matchCount === 1.U,
+        "SharedMemBackend shared access mapping error: ch=%d hart=%d vbank=%d group=%d matches=%d\n",
+        i.U,
+        io.mem_req(i).hart_id,
+        io.mem_req(i).bank_id,
+        io.mem_req(i).group_id,
+        matchCount
+      )
+    }
+  }
+
+  for (j <- 0 until totalBanks) {
+    banks(j).io.sramRead <> inputScheduler.io.bankRead(j)
+    banks(j).io.sramWrite <> inputScheduler.io.bankWrite(j)
   }
 
   io.config.ready := true.B
@@ -226,52 +244,28 @@ class SharedMemBackend(val b: GlobalConfig) extends Module {
   }
 
   for (i <- 0 until totalChannel) {
-    val req_valid = io.mem_req(i).read.req.valid || io.mem_req(i).write.req.valid
-
-    val tracePbankId = Wire(UInt(32.W))
-    tracePbankId := 0.U
-    for (j <- 0 until totalBanks) {
-      val trace_hit_bank = mappingTable(j).valid &&
-        (mappingTable(j).hart_id === io.mem_req(i).hart_id) &&
-        (mappingTable(j).vbank_id === io.mem_req(i).bank_id) &&
-        (!mappingTable(j).is_multi ||
-          (mappingTable(j).is_multi && (mappingTable(j).group_id === io.mem_req(i).group_id)))
-      when(trace_hit_bank) {
-        tracePbankId := j.U
-      }
-    }
-
-    // Memory trace: read request
-    when(io.mem_req(i).read.req.fire) {
-      emitTrace(i, 0.U, tracePbankId, io.mem_req(i).read.req.bits.addr, 0.U, 0.U, true.B)
-    }
-
-    // Memory trace: write request
-    when(io.mem_req(i).write.req.fire) {
+    when(inputScheduler.io.readIssued(i)) {
       emitTrace(
         i,
-        1.U,
-        tracePbankId,
-        io.mem_req(i).write.req.bits.addr,
-        io.mem_req(i).write.req.bits.data(63, 0),
-        io.mem_req(i).write.req.bits.data(127, 64),
+        0.U,
+        inputScheduler.io.issuedPbank(i),
+        accPipes(i).io.sramRead.req.bits.addr,
+        0.U,
+        0.U,
         true.B
       )
     }
 
-    for (j <- 0 until totalBanks) {
-      val hit_bank = mappingTable(j).valid &&
-        (mappingTable(j).hart_id === io.mem_req(i).hart_id) &&
-        (mappingTable(j).vbank_id === io.mem_req(i).bank_id) &&
-        (!mappingTable(j).is_multi ||
-          (mappingTable(j).is_multi && (mappingTable(j).group_id === io.mem_req(i).group_id)))
-
-      val hold_one = RegNext(hit_bank && req_valid, init = false.B)
-
-      when((hit_bank && req_valid) || hold_one) {
-        banks(j).io.sramRead <> accPipes(i).io.sramRead
-        banks(j).io.sramWrite <> accPipes(i).io.sramWrite
-      }
+    when(inputScheduler.io.writeIssued(i)) {
+      emitTrace(
+        i,
+        1.U,
+        inputScheduler.io.issuedPbank(i),
+        accPipes(i).io.sramWrite.req.bits.addr,
+        accPipes(i).io.sramWrite.req.bits.data(63, 0),
+        accPipes(i).io.sramWrite.req.bits.data(127, 64),
+        true.B
+      )
     }
   }
 }
