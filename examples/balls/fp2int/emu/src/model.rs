@@ -1,112 +1,124 @@
+//! Numeric reference shared by FP2INT and INT2FP in BEMU.
+//!
+//! Rust `f32` operations use binary32 round-to-nearest, ties-to-even.  The
+//! explicit `round_ties_even` below defines the final integer conversion.
+
+pub const INT8_MIN: i32 = -128;
+pub const INT8_MAX: i32 = 127;
+
+fn multiplier(scale_bits: u32) -> f32 {
+    let value = f32::from_bits(scale_bits);
+    if !value.is_finite() || !value.is_normal() || !value.is_sign_positive() {
+        panic!("quant: multiplier must be a positive normal finite FP32 value");
+    }
+    value
+}
+
+fn normalized_input(fp_bits: u32) -> f32 {
+    let value = f32::from_bits(fp_bits);
+    if value.is_subnormal() {
+        value.signum() * 0.0
+    } else {
+        value
+    }
+}
+
+fn saturate_i8(value: f32) -> i8 {
+    if value.is_nan() {
+        return 0;
+    }
+    if value >= INT8_MAX as f32 {
+        return INT8_MAX as i8;
+    }
+    if value <= INT8_MIN as f32 {
+        return INT8_MIN as i8;
+    }
+    value as i8
+}
+
 pub fn fp2int_i32_bits(fp_bits: u32, scale_bits: u32) -> i32 {
-  fp32_to_int32(fp32_multiply(fp_bits, scale_bits))
+    let scale = multiplier(scale_bits);
+    let input = normalized_input(fp_bits);
+    if input.is_nan() {
+        return 0;
+    }
+    if input == f32::INFINITY {
+        return i32::MAX;
+    }
+    if input == f32::NEG_INFINITY {
+        return i32::MIN;
+    }
+    (input * scale).round_ties_even() as i32
 }
 
 pub fn fp2int_i8_bits(fp_bits: u32, scale_bits: u32) -> i8 {
-  fp2int_i32_bits(fp_bits, scale_bits).clamp(-128, 127) as i8
+    let scale = multiplier(scale_bits);
+    let input = normalized_input(fp_bits);
+    if input == f32::INFINITY {
+        return INT8_MAX as i8;
+    }
+    if input == f32::NEG_INFINITY {
+        return INT8_MIN as i8;
+    }
+    saturate_i8((input * scale).round_ties_even())
+}
+
+pub fn dequantize_int32_to_fp32_bits(value: i32, scale_bits: u32) -> u32 {
+    ((value as f32) * multiplier(scale_bits)).to_bits()
+}
+
+pub fn requantize_int32_to_int8(value: i32, scale_bits: u32) -> i8 {
+    saturate_i8(((value as f32) * multiplier(scale_bits)).round_ties_even())
 }
 
 #[allow(dead_code)]
 pub fn fp2int_i32_word(input: [u32; 4], scale_bits: u32) -> [i32; 4] {
-  [
-    fp2int_i32_bits(input[0], scale_bits),
-    fp2int_i32_bits(input[1], scale_bits),
-    fp2int_i32_bits(input[2], scale_bits),
-    fp2int_i32_bits(input[3], scale_bits),
-  ]
+    input.map(|value| fp2int_i32_bits(value, scale_bits))
 }
 
 #[allow(dead_code)]
 pub fn fp2int_i8_group(input: [u32; 4], scale_bits: u32) -> [i8; 4] {
-  [
-    fp2int_i8_bits(input[0], scale_bits),
-    fp2int_i8_bits(input[1], scale_bits),
-    fp2int_i8_bits(input[2], scale_bits),
-    fp2int_i8_bits(input[3], scale_bits),
-  ]
-}
-
-fn fp32_multiply(a: u32, b: u32) -> u32 {
-  let a_sign = (a >> 31) & 1;
-  let b_sign = (b >> 31) & 1;
-  let a_exp = (a >> 23) & 0xff;
-  let b_exp = (b >> 23) & 0xff;
-  let a_frac = a & 0x7f_ffff;
-  let b_frac = b & 0x7f_ffff;
-  let a_mant = (1u64 << 23) | u64::from(a_frac);
-  let b_mant = (1u64 << 23) | u64::from(b_frac);
-  let a_zero = a_exp == 0 && a_frac == 0;
-  let b_zero = b_exp == 0 && b_frac == 0;
-  let prod = a_mant * b_mant;
-  let (mant, exp_adjust) = if ((prod >> 47) & 1) != 0 {
-    ((prod >> 24) as u32, 1u32)
-  } else {
-    ((prod >> 23) as u32, 0u32)
-  };
-  let exp_wide = (a_exp + b_exp + exp_adjust).wrapping_sub(127) & 0x3ff;
-
-  if a_zero || b_zero {
-    0
-  } else if (exp_wide & 0x200) != 0 {
-    0
-  } else if (exp_wide & 0x100) != 0 {
-    ((a_sign ^ b_sign) << 31) | (0xff << 23)
-  } else {
-    ((a_sign ^ b_sign) << 31) | ((exp_wide & 0xff) << 23) | (mant & 0x7f_ffff)
-  }
-}
-
-fn fp32_to_int32(fp: u32) -> i32 {
-  let sign = ((fp >> 31) & 1) != 0;
-  let exponent = ((fp >> 23) & 0xff) as i32;
-  let frac = fp & 0x7f_ffff;
-  let mantissa = (1u32 << 23) | frac;
-  let is_zero = exponent == 0 && frac == 0;
-  let exp_val = exponent - 127;
-
-  if is_zero {
-    0
-  } else if exp_val >= 31 {
-    if sign { i32::MIN } else { i32::MAX }
-  } else if exp_val < 0 {
-    if exp_val == -1 {
-      if sign { -1 } else { 1 }
-    } else {
-      0
-    }
-  } else {
-    let shift = exp_val as u32;
-    let mag = if shift >= 23 {
-      mantissa << (shift - 23)
-    } else {
-      mantissa >> (23 - shift)
-    };
-
-    if sign { -(mag as i32) } else { mag as i32 }
-  }
+    input.map(|value| fp2int_i8_bits(value, scale_bits))
 }
 
 #[cfg(test)]
 mod tests {
-  use super::*;
+    use super::*;
 
-  #[test]
-  fn int32_basic() {
-    let scale = 0x3F80_0000;
+    #[test]
+    fn fp2int_uses_rne() {
+        let one = 1.0f32.to_bits();
+        let inputs = [0.5f32, 1.5, 2.5, -0.5, -1.5, -2.5];
+        let expected = [0i8, 2, 2, 0, -2, -2];
+        for (input, expected) in inputs.iter().copied().zip(expected) {
+            assert_eq!(fp2int_i8_bits(input.to_bits(), one), expected);
+        }
+    }
 
-    assert_eq!(fp2int_i32_bits(0x3F80_0000, scale), 1);
-    assert_eq!(fp2int_i32_bits(0x4000_0000, scale), 2);
-    assert_eq!(fp2int_i32_bits(0xBF80_0000, scale), -1);
-    assert_eq!(fp2int_i32_bits(0x3F00_0000, scale), 1);
-    assert_eq!(fp2int_i32_bits(0x3FC0_0000, scale), 1);
-    assert_eq!(fp2int_i32_bits(0xC020_0000, scale), -2);
-  }
+    #[test]
+    fn fp2int_special_values_and_saturation() {
+        let one = 1.0f32.to_bits();
+        assert_eq!(fp2int_i8_bits(f32::NAN.to_bits(), one), 0);
+        assert_eq!(fp2int_i8_bits(f32::INFINITY.to_bits(), one), 127);
+        assert_eq!(fp2int_i8_bits(f32::NEG_INFINITY.to_bits(), one), -128);
+        assert_eq!(fp2int_i8_bits(127.5f32.to_bits(), one), 127);
+        assert_eq!(fp2int_i8_bits((-128.5f32).to_bits(), one), -128);
+    }
 
-  #[test]
-  fn int8_saturates() {
-    let scale = 0x3F80_0000;
+    #[test]
+    fn int32_conversion_uses_binary32_rne() {
+        let one = 1.0f32.to_bits();
+        assert_eq!(
+            dequantize_int32_to_fp32_bits((1 << 24) + 1, one),
+            ((1 << 24) as f32).to_bits()
+        );
+        assert_eq!(requantize_int32_to_int8(3, 0.5f32.to_bits()), 2);
+        assert_eq!(requantize_int32_to_int8(-3, 0.5f32.to_bits()), -2);
+    }
 
-    assert_eq!(fp2int_i8_bits(0x4300_0000, scale), 127);
-    assert_eq!(fp2int_i8_bits(0xC300_0000, scale), -128);
-  }
+    #[test]
+    #[should_panic(expected = "positive normal finite")]
+    fn illegal_multiplier_is_rejected() {
+        let _ = fp2int_i8_bits(1.0f32.to_bits(), 0);
+    }
 }

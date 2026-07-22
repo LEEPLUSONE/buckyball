@@ -29,6 +29,15 @@ typedef int32_t result_t;
 // rs1 iter field (34-bit, bits 30-63)
 #define BB_ITER(n) FIELD(n, 30, 63)
 
+// Quant scale-granularity encoding in rs2[35:34].  Scalar modes carry the
+// FP32 multiplier in rs2[31:0].  Per-channel mode reads 16 FP32 multipliers
+// from the MMIO region bound to BANK0, starting at rs2[63:36].
+#define BB_SCALE_PER_INSTRUCTION 0
+#define BB_SCALE_PER_TENSOR 1
+#define BB_SCALE_PER_CHANNEL 2
+#define BB_SCALE_GRANULARITY(mode) FIELD((uint64_t)(mode), 34, 35)
+#define BB_SCALE_TABLE_OFFSET(bytes) FIELD((uint64_t)(bytes), 36, 63)
+
 // funct7 encoding: [6:4]=enable, [3:0]=opcode
 // enable: 000=none, 001=1rd, 010=1wr, 011=1rd+1wr, 100=2rd+1wr
 //         101/110/111 = none (extended opcode space)

@@ -3,8 +3,7 @@
 use super::super::bank::{BANK_NUM, BANK_SIZE};
 use super::decode::{pbank, pbank_group, rs1_b0, rs1_b2, rs1_iter};
 use super::instruction::{ExecContext, Instruction};
-
-mod model;
+use super::{quant_model, quant_scale};
 
 pub struct Fp2Int;
 
@@ -32,7 +31,7 @@ impl Instruction for Fp2Int {
 
         let ps = pbank(ctx.bank_map, src);
         let pd = pbank(ctx.bank_map, dst);
-        let scale_bits = (xs2 & 0xffff_ffff) as u32;
+        let scale_owner_bank = src as usize;
 
         // Support two modes:
         // 1. FP32 -> INT32: src_cols=1, dst_cols=1 (4 bytes -> 4 bytes)
@@ -48,8 +47,16 @@ impl Instruction for Fp2Int {
                     }
                     for j in 0..16 {
                         let off = src_base + j * 4;
-                        let fp_bits = u32::from_le_bytes(ctx.banks[ps][off..off + 4].try_into().unwrap());
-                        let q = model::fp2int_i32_bits(fp_bits, scale_bits);
+                        let fp_bits =
+                            u32::from_le_bytes(ctx.banks[ps][off..off + 4].try_into().unwrap());
+                        let scale_bits = quant_scale::multiplier_bits(
+                            xs2,
+                            j,
+                            scale_owner_bank,
+                            ctx.mmio_banks,
+                            ctx.mmio_region_table,
+                        );
+                        let q = quant_model::fp2int_i32_bits(fp_bits, scale_bits);
                         let dst_off = dst_base + j * 4;
                         ctx.banks[pd][dst_off..dst_off + 4].copy_from_slice(&q.to_le_bytes());
                     }
@@ -67,9 +74,18 @@ impl Instruction for Fp2Int {
                         let ps = pbank_group(ctx.bank_map, src, group);
                         for lane in 0..4 {
                             let off = src_base + lane * 4;
-                            let fp_bits = u32::from_le_bytes(ctx.banks[ps][off..off + 4].try_into().unwrap());
-                            let q = model::fp2int_i8_bits(fp_bits, scale_bits);
-                            ctx.banks[pd][dst_base + group as usize * 4 + lane] = q as u8;
+                            let fp_bits =
+                                u32::from_le_bytes(ctx.banks[ps][off..off + 4].try_into().unwrap());
+                            let logical_lane = group as usize * 4 + lane;
+                            let scale_bits = quant_scale::multiplier_bits(
+                                xs2,
+                                logical_lane,
+                                scale_owner_bank,
+                                ctx.mmio_banks,
+                                ctx.mmio_region_table,
+                            );
+                            let q = quant_model::fp2int_i8_bits(fp_bits, scale_bits);
+                            ctx.banks[pd][dst_base + logical_lane] = q as u8;
                         }
                     }
                 }

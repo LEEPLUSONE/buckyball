@@ -4,6 +4,10 @@ pub use super::bank_matrix;
 pub use super::decode;
 pub use super::instruction;
 
+#[path = "../../../../balls/gemmini/emu/src/02_gemmini_config.rs"]
+pub mod f02_gemmini_config;
+#[path = "../../../../balls/gemmini/emu/src/03_gemmini_flush.rs"]
+pub mod f03_gemmini_flush;
 #[path = "../../../../balls/trace/emu/src/04_bdb_counter.rs"]
 pub mod f04_bdb_counter;
 #[path = "../../../../balls/im2col/emu/src/48_im2col.rs"]
@@ -16,10 +20,6 @@ pub mod f50_relu;
 pub mod f51_fp2int;
 #[path = "../../../../balls/int2fp/emu/src/52_int2fp.rs"]
 pub mod f52_int2fp;
-#[path = "../../../../balls/gemmini/emu/src/02_gemmini_config.rs"]
-pub mod f02_gemmini_config;
-#[path = "../../../../balls/gemmini/emu/src/03_gemmini_flush.rs"]
-pub mod f03_gemmini_flush;
 #[path = "../../../../balls/gemmini/emu/src/53_gemmini_preload.rs"]
 pub mod f53_gemmini_preload;
 #[path = "../../../../balls/mxfp2int/emu/src/55_mxfp2int.rs"]
@@ -38,6 +38,10 @@ pub mod f80_gemmini_loop_ws;
 pub mod f96_gemmini_loop_conv_ws;
 #[path = "../../../../balls/gemmini/emu/src/gemmini_state.rs"]
 pub mod gemmini_state;
+#[path = "../../../../balls/fp2int/emu/src/model.rs"]
+pub mod quant_model;
+#[path = "../../../../balls/fp2int/emu/src/scale.rs"]
+pub mod quant_scale;
 
 use instruction::{ExecContext, Instruction};
 

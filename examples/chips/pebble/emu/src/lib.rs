@@ -6,8 +6,16 @@ pub use super::instruction;
 
 #[path = "../../../../balls/transpose/emu/src/49_transpose.rs"]
 pub mod f49_transpose;
+#[path = "../../../../balls/fp2int/emu/src/51_fp2int.rs"]
+pub mod f51_fp2int;
+#[path = "../../../../balls/int2fp/emu/src/52_int2fp.rs"]
+pub mod f52_int2fp;
 #[path = "../../../../balls/matrix/emu/src/65_matrix.rs"]
 pub mod f65_matrix;
+#[path = "../../../../balls/fp2int/emu/src/model.rs"]
+pub mod quant_model;
+#[path = "../../../../balls/fp2int/emu/src/scale.rs"]
+pub mod quant_scale;
 
 use instruction::{ExecContext, Instruction};
 
@@ -51,5 +59,7 @@ register_instructions! {
   super::f34_mmio_set::MmioSet,
   super::f35_mvin_mmio::MvinMmio,
   f49_transpose::Transpose,
+  f51_fp2int::Fp2Int,
+  f52_int2fp::Int2Fp,
   f65_matrix::Matrix,
 }
