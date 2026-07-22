@@ -48,6 +48,7 @@ typedef struct {
 static unsigned long fp2int_issues;
 static unsigned long int2fp_issues;
 static unsigned long matrix_issues;
+static int verify_numerics = 1;
 static int32_t requant_packed[MAX_REQUANT_ROWS * TILE]
     __attribute__((aligned(64)));
 static int8_t requant_output[MAX_REQUANT_ROWS * TILE]
@@ -206,16 +207,18 @@ static int32_t *pebble_matmul(const int8_t *a, const int8_t *b, int m, int n,
   bb_mem_release(1);
   bb_mem_release(2);
 
-  for (int i = 0; i < m; ++i) {
-    for (int j = 0; j < n; ++j) {
-      int32_t expected = 0;
-      for (int kk = 0; kk < k; ++kk)
-        expected += (int32_t)a[i * k + kk] * (int32_t)b[kk * b_stride + j];
-      if (output[i * n + j] != expected) {
-        printf("[LeNet/Pebble] MATRIX mismatch m=%d n=%d k=%d at (%d,%d): "
-               "got=%d expected=%d\n",
-               m, n, k, i, j, output[i * n + j], expected);
-        die("MATRIX tile accumulation check failed");
+  if (verify_numerics) {
+    for (int i = 0; i < m; ++i) {
+      for (int j = 0; j < n; ++j) {
+        int32_t expected = 0;
+        for (int kk = 0; kk < k; ++kk)
+          expected += (int32_t)a[i * k + kk] * (int32_t)b[kk * b_stride + j];
+        if (output[i * n + j] != expected) {
+          printf("[LeNet/Pebble] MATRIX mismatch m=%d n=%d k=%d at (%d,%d): "
+                 "got=%d expected=%d\n",
+                 m, n, k, i, j, output[i * n + j], expected);
+          die("MATRIX tile accumulation check failed");
+        }
       }
     }
   }
@@ -256,14 +259,16 @@ static int8_t *pebble_requantize(const int32_t *accumulator,
     for (int i = 0; i < m; ++i)
       for (int j = 0; j < nt; ++j) {
         output[i * n + n0 + j] = packed_output[i * TILE + j];
-        int8_t expected =
-            scalar_requantize_rne(packed[i * TILE + j], multiplier_bits);
-        if (output[i * n + n0 + j] != expected) {
-          printf("[LeNet/Pebble] requant mismatch row=%d channel=%d acc=%d "
-                 "got=%d expected=%d multiplier=0x%08x\n",
-                 i, n0 + j, packed[i * TILE + j], output[i * n + n0 + j],
-                 expected, multiplier_bits);
-          die("INT32-to-INT8 requant check failed");
+        if (verify_numerics) {
+          int8_t expected =
+              scalar_requantize_rne(packed[i * TILE + j], multiplier_bits);
+          if (output[i * n + n0 + j] != expected) {
+            printf("[LeNet/Pebble] requant mismatch row=%d channel=%d acc=%d "
+                   "got=%d expected=%d multiplier=0x%08x\n",
+                   i, n0 + j, packed[i * TILE + j], output[i * n + n0 + j],
+                   expected, multiplier_bits);
+            die("INT32-to-INT8 requant check failed");
+          }
         }
       }
   }

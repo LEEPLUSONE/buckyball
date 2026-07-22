@@ -54,3 +54,27 @@ by BEMU's current fast linear address mapping.
 
 The program succeeds only if the final INT8 logits, dequantized FP32 logits,
 and classification match the Python golden embedded in the payload.
+
+## Full MNIST accuracy evaluation
+
+Generate either the full test split or a non-overlapping shard. Each payload
+stores the shared weights once and the Python FP32 class plus exact INT8 logits
+for every sample:
+
+```bash
+python3 generate_lenet_int8_eval_payload.py \
+  --checkpoint /path/to/LeNet/lenet-model.pth \
+  --mnist-root /path/to/LeNet/data/MNIST \
+  --offset 0 --limit 1000 \
+  --output lenet_int8_eval_payload.bin \
+  --summary lenet_int8_eval_payload.json
+```
+
+Build `lenet_int8_bemu_eval.c` with the same compiler flags and include paths
+shown above, then run `lenet_int8_bemu_eval-linux`. The guest quantizes weights
+only once, performs scalar MATRIX/requant checks on the first sample, and
+reports FP32 Top-1, Pebble INT8 Top-1, accuracy loss, prediction agreement, and
+exact Python/BEMU INT8-logit agreement over the payload.
+
+Top-1 tie-breaking is deterministic: the lowest class index wins, matching
+`argmax` and the guest's strict-greater comparison.
