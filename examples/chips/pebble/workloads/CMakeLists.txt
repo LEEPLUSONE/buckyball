@@ -15,6 +15,8 @@ set(BUCKYBALL_BALL_CTEST_DIRS
 )
 buckyball_add_ball_ctest_subdirs()
 
+add_subdirectory(ctests)
+
 add_custom_target(chip-workloads-build ALL
   DEPENDS pebble-ctests-build
   COMMENT "Building pebble workloads"
