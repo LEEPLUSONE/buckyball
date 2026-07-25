@@ -78,3 +78,48 @@ exact Python/BEMU INT8-logit agreement over the payload.
 
 Top-1 tie-breaking is deterministic: the lowest class index wins, matching
 `argmax` and the guest's strict-greater comparison.
+
+## Per-channel activation and weight evaluation
+
+`lenet_int8_channel_bemu_eval.c` implements the quant-eval per-channel
+hardware contract in Pebble BEMU. Activations use one scale per NCHW/NC
+channel (a flattened Linear feature is a channel), weights use one scale per
+output channel, and layer outputs/requantization use one scale per output
+channel.
+
+The guest loads up to 256 FP32 values into a 1 KiB MMIO scale table and binds
+that table to the conversion instruction's source bank. The physical mapping
+is explicit:
+
+- activation row: one spatial position, lanes 0..15 are channel block
+  `c0..c0+15`;
+- weight row: one reduction index, lanes 0..15 are output-channel block
+  `oc0..oc0+15`;
+- requant row: one output position, lanes 0..15 are output-channel block
+  `oc0..oc0+15`.
+
+Every block passes `table_offset = c0 * sizeof(float)` (or `oc0 *
+sizeof(float)`) to the per-channel instruction. Linear layers exercise
+non-zero offsets because their channel counts exceed 16. The guest also
+implements mixed-input-scale accumulation: raw products are reduced per
+input/output scale pair, passed through Pebble `INT2FP` plus `FP2INT` for
+binary32 RNE alignment to the largest product step, then accumulated and
+requantized with the output-channel table.
+
+Generate a payload from the calibration manifest:
+
+```bash
+python3 generate_lenet_int8_channel_eval_payload.py \
+  --checkpoint /path/to/LeNet/lenet-model.pth \
+  --manifest /path/to/channel/calibration_manifest.json \
+  --mnist-root /path/to/LeNet/data/MNIST \
+  --offset 0 --limit 10 \
+  --output lenet_int8_channel_eval_payload.bin \
+  --summary lenet_int8_channel_eval_payload.json
+```
+
+Build and run `lenet_int8_channel_bemu_eval.c` with the same compiler/BEMU
+commands used above. The program fails on the first sample whose final INT8
+logits differ from the Python hardware-contract golden. Classification is
+performed after per-channel dequantization; comparing raw INT8 logits would be
+incorrect because the ten output channels have different steps.
