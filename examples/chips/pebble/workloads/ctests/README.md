@@ -82,29 +82,29 @@ Top-1 tie-breaking is deterministic: the lowest class index wins, matching
 ## Per-channel activation and weight evaluation
 
 `lenet_int8_channel_bemu_eval.c` implements the quant-eval per-channel
-hardware contract in Pebble BEMU. Activations use one scale per NCHW/NC
-channel (a flattened Linear feature is a channel), weights use one scale per
-output channel, and layer outputs/requantization use one scale per output
-channel.
+hardware contract in Pebble BEMU. Convolution inputs use one scale per logical
+NCHW channel, Linear inputs use one scale for the whole activation tensor,
+weights use one scale per output channel, and layer outputs/requantization use
+one scale per output channel.
 
 The guest loads up to 256 FP32 values into a 1 KiB MMIO scale table and binds
 that table to the conversion instruction's source bank. The physical mapping
 is explicit:
 
-- activation row: one spatial position, lanes 0..15 are channel block
-  `c0..c0+15`;
+- convolution activation row: one spatial position, lanes 0..15 are channel
+  block `c0..c0+15`;
 - weight row: one reduction index, lanes 0..15 are output-channel block
   `oc0..oc0+15`;
 - requant row: one output position, lanes 0..15 are output-channel block
   `oc0..oc0+15`.
 
-Every block passes `table_offset = c0 * sizeof(float)` (or `oc0 *
-sizeof(float)`) to the per-channel instruction. Linear layers exercise
-non-zero offsets because their channel counts exceed 16. The guest also
-implements mixed-input-scale accumulation: raw products are reduced per
-input/output scale pair, passed through Pebble `INT2FP` plus `FP2INT` for
-binary32 RNE alignment to the largest product step, then accumulated and
-requantized with the output-channel table.
+Each per-channel block passes `table_offset = c0 * sizeof(float)` (or `oc0 *
+sizeof(float)`) to the conversion instruction. Linear inputs instead use the
+scalar FP2INT instruction and do not require a lane-to-channel lookup. Linear
+weights and outputs still exercise non-zero table offsets because their output
+channel counts exceed 16. For convolution, the guest aligns partial sums from
+different input/output scale pairs through Pebble `INT2FP` plus `FP2INT` with
+binary32 RNE before accumulation and final output-channel requantization.
 
 Generate a payload from the calibration manifest:
 

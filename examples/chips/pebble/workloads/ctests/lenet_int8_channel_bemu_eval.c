@@ -8,7 +8,7 @@
 #include <string.h>
 
 #define LENET_MAGIC 0x4c4e5438u
-#define LENET_CHANNEL_VERSION 3u
+#define LENET_CHANNEL_VERSION 4u
 #define LAYER_COUNT 5
 #define TILE 16
 #define MAX_CHANNELS 256
@@ -75,8 +75,6 @@ static int8_t i8_output_staging[MAX_BANK_ROWS * TILE]
     __attribute__((aligned(64)));
 static int32_t i32_staging[MAX_BANK_ROWS * TILE] __attribute__((aligned(64)));
 static int32_t i32_output_staging[MAX_BANK_ROWS * TILE]
-    __attribute__((aligned(64)));
-static int32_t linear_products[TILE * MAX_N_PADDED]
     __attribute__((aligned(64)));
 static uint8_t file_staging[4096] __attribute__((aligned(4096)));
 
@@ -220,6 +218,39 @@ static void pebble_fp2int_channel(const float *input, int8_t *output,
   bb_mem_release(1);
 }
 
+static void pebble_fp2int_tensor(const float *input, int8_t *output,
+                                 int count, float multiplier) {
+  if (count <= 0)
+    die("invalid tensor FP2INT element count");
+
+  bb_mem_alloc(0, 1, 4);
+  bb_mem_alloc(1, 1, 1);
+  for (int element0 = 0; element0 < count;
+       element0 += MAX_BANK_ROWS * TILE) {
+    int elements = count - element0;
+    if (elements > MAX_BANK_ROWS * TILE)
+      elements = MAX_BANK_ROWS * TILE;
+    int rows = (elements + TILE - 1) / TILE;
+    memset(fp_staging, 0, (size_t)rows * TILE * sizeof(float));
+    memcpy(fp_staging, input + element0, (size_t)elements * sizeof(float));
+    bb_mvin((uintptr_t)fp_staging, 0, rows, 1);
+    bb_fp2int_ex(0, 1, rows, fp32_bits(multiplier), BB_SCALE_PER_TENSOR, 0);
+    ++fp2int_issues;
+    bb_mvout((uintptr_t)i8_output_staging, 1, rows, 1);
+    bb_fence();
+    memcpy(output + element0, i8_output_staging, (size_t)elements);
+    if (verify_numerics)
+      for (int index = 0; index < elements; ++index) {
+        int8_t expected =
+            scalar_quantize(input[element0 + index], multiplier);
+        if (output[element0 + index] != expected)
+          die("per-tensor Linear activation FP2INT mismatch");
+      }
+  }
+  bb_mem_release(0);
+  bb_mem_release(1);
+}
+
 static void pebble_int2fp_channel(const int8_t *input, float *output,
                                   int positions, int channels, int stride,
                                   const float *steps) {
@@ -287,6 +318,21 @@ static int8_t *rescale_channel(const int8_t *input, int positions, int channels,
                         previous_steps);
   pebble_fp2int_channel(real, output, positions, channels, channels,
                         next_multipliers);
+  free(real);
+  return output;
+}
+
+static int8_t *rescale_channel_to_tensor(const int8_t *input, int positions,
+                                         int channels,
+                                         const float *previous_step,
+                                         float next_multiplier) {
+  float *real = (float *)checked_malloc(
+      (size_t)positions * channels * sizeof(float));
+  int8_t *output =
+      (int8_t *)checked_malloc((size_t)positions * channels * sizeof(int8_t));
+  pebble_int2fp_channel(input, real, positions, channels, channels,
+                        previous_step);
+  pebble_fp2int_tensor(real, output, positions * channels, next_multiplier);
   free(real);
   return output;
 }
@@ -393,81 +439,15 @@ static int64_t *pebble_linear_channel(const int8_t *input, const Layer *layer) {
   int k = (int)layer->header.k;
   int n = (int)layer->header.n;
   int n_padded = (int)layer->header.n_padded;
+  if (layer->header.input_scale_count != 1)
+    die("Linear activation must use one per-tensor scale");
+
   int64_t *accumulator = (int64_t *)checked_calloc((size_t)n, sizeof(int64_t));
-  int8_t a_tile[TILE * TILE] __attribute__((aligned(64)));
-  int8_t b_tile[TILE * TILE] __attribute__((aligned(64)));
-  int32_t c_tile[TILE * TILE] __attribute__((aligned(64)));
-
-  bb_mem_alloc(0, 1, 1);
-  bb_mem_alloc(1, 1, 1);
-  bb_mem_alloc(2, 1, 4);
-  bb_mem_alloc(3, 1, 1);
-  bb_mem_alloc(4, 1, 1);
-  bb_mem_alloc(5, 1, 1);
-  for (int k0 = 0; k0 < k; k0 += TILE) {
-    int kt = k - k0 < TILE ? k - k0 : TILE;
-    memset(linear_products, 0, sizeof(linear_products));
-    for (int n0 = 0; n0 < n; n0 += TILE) {
-      int nt = n - n0 < TILE ? n - n0 : TILE;
-      memset(a_tile, 0, sizeof(a_tile));
-      memset(b_tile, 0, sizeof(b_tile));
-      memset(c_tile, 0, sizeof(c_tile));
-      for (int row = 0; row < kt; ++row) {
-        a_tile[row * TILE + row] = input[k0 + row];
-        for (int lane = 0; lane < nt; ++lane)
-          b_tile[row * TILE + lane] =
-              layer->weight[(k0 + row) * n_padded + n0 + lane];
-      }
-      bb_mvin((uintptr_t)a_tile, 0, kt, 1);
-      bb_mvin((uintptr_t)b_tile, 1, kt, 1);
-      bb_matrix_mnk(0, 1, 2, kt, nt, kt);
-      ++matrix_issues;
-      bb_mvout((uintptr_t)c_tile, 2, kt, 1);
-      bb_fence();
-      for (int row = 0; row < kt; ++row)
-        for (int lane = 0; lane < nt; ++lane)
-          linear_products[row * MAX_N_PADDED + n0 + lane] =
-              c_tile[row * TILE + lane];
-    }
-
-    for (int row = 0; row < kt; ++row) {
-      const float *ratios = layer->alignment + (size_t)(k0 + row) * n;
-      load_scale_table(3, ratios, n);
-      for (int n0 = 0; n0 < n; n0 += TILE) {
-        int nt = n - n0 < TILE ? n - n0 : TILE;
-        memset(i32_staging, 0, TILE * sizeof(int32_t));
-        for (int lane = 0; lane < nt; ++lane)
-          i32_staging[lane] = linear_products[row * MAX_N_PADDED + n0 + lane];
-        bb_mvin((uintptr_t)i32_staging, 3, 4, 1);
-        bb_int2fp_scale_ex(3, 4, 1, 0, BB_SCALE_PER_CHANNEL, n0 * 4);
-        ++int2fp_issues;
-        bb_fp2int_ex(4, 5, 1, fp32_bits(1.0f), BB_SCALE_PER_TENSOR, 0);
-        ++fp2int_issues;
-        bb_mvout((uintptr_t)i32_output_staging, 5, 4, 1);
-        bb_fence();
-        for (int lane = 0; lane < nt; ++lane) {
-          int channel = n0 + lane;
-          int32_t aligned = i32_output_staging[lane];
-          accumulator[channel] += aligned;
-          if (verify_numerics) {
-            int32_t expected =
-                rne_i32((float)linear_products[row * MAX_N_PADDED + channel] *
-                        ratios[channel]);
-            if (aligned != expected)
-              die("linear per-channel alignment mismatch");
-          }
-        }
-      }
-    }
-  }
+  int32_t *partial = pebble_matmul_slice(input, layer->weight, 1, n, k,
+                                         n_padded, 0, k);
   for (int channel = 0; channel < n; ++channel)
-    accumulator[channel] += layer->bias[channel];
-  bb_mem_release(0);
-  bb_mem_release(1);
-  bb_mem_release(2);
-  bb_mem_release(3);
-  bb_mem_release(4);
-  bb_mem_release(5);
+    accumulator[channel] = (int64_t)partial[channel] + layer->bias[channel];
+  free(partial);
   return accumulator;
 }
 
@@ -633,7 +613,9 @@ static FILE *load_payload(const char *path, PayloadHeader *payload,
         layer->header.alignment_count !=
             layer->header.input_scale_count * layer->header.n ||
         layer->header.bias_count != layer->header.n ||
+        layer->header.input_scale_count == 0 ||
         layer->header.input_scale_count > MAX_CHANNELS ||
+        (index >= 2 && layer->header.input_scale_count != 1) ||
         layer->header.n > MAX_CHANNELS ||
         layer->header.n_padded > MAX_N_PADDED ||
         layer->header.n_padded % TILE != 0)
@@ -715,21 +697,21 @@ static int8_t *run_inference(const float *input, Layer layers[LAYER_COUNT]) {
   float *fc1_real = flatten_nchw_float(fc1_nhwc, 4, 4, 16);
   free(fc1_nhwc);
   int8_t *fc1_input = (int8_t *)checked_malloc(256);
-  pebble_fp2int_channel(fc1_real, fc1_input, 1, 256, 256,
-                        layers[2].input_multiplier);
+  pebble_fp2int_tensor(fc1_real, fc1_input, 256,
+                       layers[2].input_multiplier[0]);
   free(fc1_real);
 
   int8_t *fc1 = run_linear(fc1_input, &layers[2]);
   free(fc1_input);
   relu_int8(fc1, 120);
-  int8_t *fc2_input = rescale_channel(fc1, 1, 120, layers[2].output_step,
-                                      layers[3].input_multiplier);
+  int8_t *fc2_input = rescale_channel_to_tensor(
+      fc1, 1, 120, layers[2].output_step, layers[3].input_multiplier[0]);
   free(fc1);
   int8_t *fc2 = run_linear(fc2_input, &layers[3]);
   free(fc2_input);
   relu_int8(fc2, 84);
-  int8_t *fc3_input = rescale_channel(fc2, 1, 84, layers[3].output_step,
-                                      layers[4].input_multiplier);
+  int8_t *fc3_input = rescale_channel_to_tensor(
+      fc2, 1, 84, layers[3].output_step, layers[4].input_multiplier[0]);
   free(fc2);
   int8_t *fc3 = run_linear(fc3_input, &layers[4]);
   free(fc3_input);

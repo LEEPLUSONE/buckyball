@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Generate a per-channel LeNet accuracy payload for Pebble BEMU.
 
-Activation, weight, and output scales are all taken from a quant-eval
-calibration manifest.  The golden model follows the hardware accumulator
-contract: raw products are reduced per input/weight scale pair, each partial
-is RNE-aligned to the largest product step for that output channel, and the
-result is requantized with an output-channel multiplier.
+Scales are taken from a quant-eval calibration manifest.  Convolution
+activations use logical-channel scales, Linear activations use one tensor
+scale, and weights/outputs use output-channel scales.  The golden model
+follows the hardware accumulator contract: raw products are reduced per
+input/weight scale pair, each partial is RNE-aligned to the largest product
+step for that output channel, and the result is requantized with an
+output-channel multiplier.
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ from generate_lenet_int8_payload import (
 )
 
 
-VERSION = 3
+VERSION = 4
 LAYER_NAMES = ("conv1", "conv2", "fc1", "fc2", "fc3")
 LAYER_KINDS = ("conv", "conv", "linear", "linear", "linear")
 
@@ -72,7 +74,7 @@ def prepare_layers(model, manifest: dict[str, object]) -> list[dict[str, object]
         input_multiplier, input_step = scale_values(calibrated, "input")
         weight_multiplier, weight_step = scale_values(calibrated, "weight")
         output_multiplier, output_step = scale_values(calibrated, "output")
-        expected_input_groups = module.in_channels if kind == "conv" else k
+        expected_input_groups = module.in_channels if kind == "conv" else 1
         if input_multiplier.size != expected_input_groups:
             raise ValueError(f"{name}: unexpected input channel count")
         if weight_multiplier.size != n or output_multiplier.size != n:
@@ -154,12 +156,11 @@ def run_conv(columns: np.ndarray, layer: dict[str, object]) -> np.ndarray:
 
 
 def run_linear(values: np.ndarray, layer: dict[str, object]) -> np.ndarray:
-    products = np.multiply(
-        values.reshape(-1, 1).astype(np.int64),
-        layer["qweight"][: layer["k"], : layer["n"]].astype(np.int64),
-    )
-    aligned = align_partial(products, layer["alignment"])
-    return requantize(aligned.sum(axis=0, keepdims=True), layer)
+    partial = values.astype(np.int64) @ layer["qweight"][
+        : layer["k"], : layer["n"]
+    ].astype(np.int64)
+    aligned = align_partial(partial, layer["alignment"])
+    return requantize(aligned, layer)
 
 
 def rescale_channel(
@@ -310,7 +311,7 @@ def main() -> None:
         "prediction_agreement": agreement / count,
         "payload_bytes": args.output.stat().st_size,
         "scale_mode": "per-channel",
-        "activation_scale": "per-channel",
+        "activation_scale": "conv-per-channel-linear-per-tensor",
         "weight_scale": "per-output-channel",
         "accumulator": "max-product-step-rne-alignment",
         "rounding": "RNE",
