@@ -1,19 +1,5 @@
-pub fn fp2int_i32_bits(fp_bits: u32, scale_bits: u32) -> i32 {
-    fp32_to_int32(fp32_multiply(fp_bits, scale_bits))
-}
-
 pub fn fp2int_i8_bits(fp_bits: u32, scale_bits: u32) -> i8 {
-    fp2int_i32_bits(fp_bits, scale_bits).clamp(-128, 127) as i8
-}
-
-#[allow(dead_code)]
-pub fn fp2int_i32_word(input: [u32; 4], scale_bits: u32) -> [i32; 4] {
-    [
-        fp2int_i32_bits(input[0], scale_bits),
-        fp2int_i32_bits(input[1], scale_bits),
-        fp2int_i32_bits(input[2], scale_bits),
-        fp2int_i32_bits(input[3], scale_bits),
-    ]
+    fp32_to_int32(fp32_multiply(fp_bits, scale_bits)).clamp(-128, 127) as i8
 }
 
 #[allow(dead_code)]
@@ -119,21 +105,6 @@ fn fp32_to_int32(fp: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn int32_basic() {
-        let scale = 0x3F80_0000;
-
-        assert_eq!(fp2int_i32_bits(0x3F80_0000, scale), 1);
-        assert_eq!(fp2int_i32_bits(0x4000_0000, scale), 2);
-        assert_eq!(fp2int_i32_bits(0xBF80_0000, scale), -1);
-        assert_eq!(fp2int_i32_bits(0x3F00_0000, scale), 0); //  0.5 -> even 0
-        assert_eq!(fp2int_i32_bits(0xBF00_0000, scale), 0); // -0.5 -> even 0
-        assert_eq!(fp2int_i32_bits(0x3FC0_0000, scale), 2); //  1.5 -> even 2
-        assert_eq!(fp2int_i32_bits(0xBFC0_0000, scale), -2); // -1.5 -> even -2
-        assert_eq!(fp2int_i32_bits(0x4020_0000, scale), 2); //  2.5 -> even 2
-        assert_eq!(fp2int_i32_bits(0xC020_0000, scale), -2); // -2.5 -> even -2
-    }
 
     #[test]
     fn int8_saturates() {

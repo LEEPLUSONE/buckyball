@@ -1,4 +1,4 @@
-//===- 51_fp2int.rs - FP2INT instruction (FP32 to INT quantization) --------===//
+//===- 51_fp2int.rs - FP2INT instruction (FP32 to packed INT8) ------------===//
 
 use super::super::bank::{bank_num, bank_size};
 use super::decode::{pbank, pbank_group, rs1_b0, rs1_b2, rs1_iter};
@@ -32,48 +32,28 @@ impl Instruction for Fp2Int {
 
         let scale_bits = (xs2 & 0xffff_ffff) as u32;
 
-        match (sc.cols, dc.cols) {
-            (1, 1) => {
-                let ps = pbank(ctx.bank_map, src);
-                let pd = pbank(ctx.bank_map, dst);
-                for i in 0..depth {
-                    let base = i * 16;
-                    if base + 16 > bank_size() {
-                        panic!("fp2int: out of range");
-                    }
-                    for lane in 0..4 {
-                        let off = base + lane * 4;
-                        let fp_bits =
-                            u32::from_le_bytes(ctx.banks[ps][off..off + 4].try_into().unwrap());
-                        let q = model::fp2int_i32_bits(fp_bits, scale_bits);
-                        ctx.banks[pd][off..off + 4].copy_from_slice(&q.to_le_bytes());
-                    }
-                }
+        if (sc.cols, dc.cols) != (4, 1) {
+            panic!(
+                "fp2int: FP32-to-INT8 requires src_cols=4 and dst_cols=1, got src_cols={} dst_cols={}",
+                sc.cols, dc.cols
+            );
+        }
+
+        let pd = pbank(ctx.bank_map, dst);
+        for i in 0..depth {
+            let base = i * 16;
+            if base + 16 > bank_size() {
+                panic!("fp2int: out of range");
             }
-            (4, 1) => {
-                let pd = pbank(ctx.bank_map, dst);
-                for i in 0..depth {
-                    let base = i * 16;
-                    if base + 16 > bank_size() {
-                        panic!("fp2int: out of range");
-                    }
-                    for group in 0..4 {
-                        let ps = pbank_group(ctx.bank_map, src, group);
-                        for lane in 0..4 {
-                            let off = base + lane * 4;
-                            let fp_bits =
-                                u32::from_le_bytes(ctx.banks[ps][off..off + 4].try_into().unwrap());
-                            let q = model::fp2int_i8_bits(fp_bits, scale_bits);
-                            ctx.banks[pd][base + group as usize * 4 + lane] = q as u8;
-                        }
-                    }
+            for group in 0..4 {
+                let ps = pbank_group(ctx.bank_map, src, group);
+                for lane in 0..4 {
+                    let off = base + lane * 4;
+                    let fp_bits =
+                        u32::from_le_bytes(ctx.banks[ps][off..off + 4].try_into().unwrap());
+                    let q = model::fp2int_i8_bits(fp_bits, scale_bits);
+                    ctx.banks[pd][base + group as usize * 4 + lane] = q as u8;
                 }
-            }
-            _ => {
-                panic!(
-                    "fp2int: unsupported layout src_cols={} dst_cols={}. Supported: (1,1) for FP32->INT32, (4,1) for FP32->INT8",
-                    sc.cols, dc.cols
-                );
             }
         }
         0
